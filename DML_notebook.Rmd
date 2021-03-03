@@ -1,0 +1,712 @@
+---
+title: "Debiased Machine Learning Guide"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Introduction
+
+Causal inference is an important task in economics. In a complex world with many factors for economists to consider, it is extremely valuable to know what actually causes economic phenomena. However, this is a difficult task in economics because it is often impossible or infeasible to actually run an experiment, making discerning a causal impact difficult. Economists have come up with many methods to attempt to solve this problem. One emerging method that was recently discovered is called debiased machine learning. This method leverages the effectiveness of machine learning in prediction tasks to accurately calculate causal parameters.
+
+The basic problem of causal inference is to find, when all other factors are held constant, what is the average treatment effect across a population. We are essentially interested in comparing two nearly identical worlds, that differ only in that in one world some treatment is applied, and in the other world the treatment is not applied. One way we might approach this is to try to model the world. Using a sophisticated machine learning model, it is possible to predict an outcome variable given a large number of input variables. If we believe that this model accurately captures how the world works, then we can find a causal treatment effect by comparing two inputs where everything is held constant except for the treatment variable. One such model could be the conditional expectation function $\gamma_0(D_i=t,X) = \mathbb{E}[Y|D_i=t,X]$. Let our data consist of inputs $W_i = (D_i,X_i)$. Then, we can use the equation 
+
+$\hat{\theta} = 1/n\sum_{i=1}^{n} m(W_i,\hat{\gamma})$ where $m(W_i,\hat{\gamma}) = \hat{\gamma}(D_i = 1, X_i)-\hat{\gamma}(D_i = 0, X_i)$
+to estimate $\hat{\theta}$. However, this approach suffers from bias and doesn't return an accurate estimate for $\theta$. This is where debiased machine learning comes in. Debiased machine learning adjusts the results above to remove bias using the following equation:
+
+$$\hat{\theta} = \frac{1}{n}\sum_{l=1}^{L}\sum_{i \in I_l} m(W_i,\hat{\gamma}_l)+\hat{\alpha}_l(W_i)(Y_i-\hat{\gamma}_l(X_i))$$ 
+
+where $\alpha$ is a learned parameter called the riesz representer (discussed in appendix C). Using this insight into how to remove bias, we can then calculate causal parameters using debiased machine learning. The algorithm for debiased machine learning is as follows:
+
+1) Split the dataset into L subsets $I_1,..I_L$.
+2) Learn $\alpha_l$ and $\gamma_l$ from elements outside of $I_l$.
+3) Calculate $\hat{\theta}$ using learned $\alpha_l$ and $\gamma_l$ on elements they haven't been trained on in $I_l$ and averaging over all i. This process is captured in the following equation: $$\hat{\theta} = \frac{1}{n}\sum_{l=1}^{L}\sum_{i \in I_l} m(W_i,\hat{\gamma}_l)+\hat{\alpha}_l(W_i)(Y_i-\hat{\gamma}_l(X_i))$$
+
+This guide will walk through R code for the aforementioned debiased machine learning algorithm. The example used looks at the impact of access to a 401k on lifetime savings. This guide has two goals: 
+
+1) Help the reader understand the technical details of the debiased machine learning algorithm
+2) Provide a framework the reader can use to implement debiased machine learning with their own data and specifications
+
+The text above each paragraph will provide an overview of what the code below does. Details about specifics of the code will be explained in comments in the code. The appendix will walk through how to adapt the code for use with your own data.
+
+This guide will focus very little on the math behind debiased machine learning. If the reader is interested in this, there will be some discussion in the appendix, but the best source is the original paper on debiased machine learning at https://arxiv.org/abs/1608.00060.
+
+## Setting Initial Parameters/Loading Packages
+
+Below are the necessary packages and basic functions. Short descriptions are available above each of the functions. For the code to work, change the working directory at the end of this code block to the directory with the downloaded 401k data (or directory with your data if you are using your own dataset).
+
+```{r}
+rm(list=ls())
+
+###########
+#Libraries#
+###########
+
+library("foreign")
+library("dplyr") 
+library("ggplot2")
+library("quantreg") #used for rq.fit.sfn
+library("nnet")	#used for mulitnom
+library("randomForest")
+
+#################
+#Basic Functions#
+#################
+
+#Euclidean Norm
+two.norm <- function(x){
+  return(sqrt(x %*% x))
+} 
+
+#dictionary that converts d and z to vector with intercept term
+#used to calculate alpha and gamma
+b<-function(d,z){
+  return(c(1,d,z))
+}
+
+#dictionary that converts d and z to vector with intercept term and interaction term
+#used to calculate alpha and gamma
+b2<-function(d,z){
+  return(c(1,d,z,d*z))
+}
+
+#m function mentioned in the introduction
+m<-function(y,d,z,gamma){ #all data arguments to make interchangeable with m2
+  return(gamma(1,z)-gamma(0,z))
+}
+#used to calculate matrix N, which is used to calculate gamma_hat and perform regression
+m2<-function(y,d,z,gamma){
+  return(y*gamma(d,z))
+}
+#psi_tilde for debiased machine learning (actual parameter, debiased moment function)
+psi_tilde<-function(y,d,z,m,alpha,gamma){
+  return(m(y,d,z,gamma)+alpha(d,z)*(y-gamma(d,z)))
+}
+#psi_tilde with a bias. Used to demonstrate shortfall of not accounting for bias. Won't achieve actual debiased machine learning
+psi_tilde_bias<-function(y,d,z,m,alpha,gamma){
+  return(m(y,d,z,gamma))
+}
+#Gets M,N and G matrices. These are necessary for calculating the riesz representer, which is discussed in appendix C, and also calculating gamma. Outputs will have dimensions: M (p x 1), N (p x 1), G (p x p)
+get_MNG<-function(Y,T,X,b){
+  
+  p=length(b(T[1],X[1,]))
+  n.nl=length(T)
+  
+  B=matrix(0,n.nl,p)
+  M=matrix(0,p,n.nl)
+  N=matrix(0,p,n.nl)
+  #Takes average by collecting into a matrix and averaging the rows
+  for (i in 1:n.nl){
+    B[i,]=b(T[i],X[i,])
+    M[,i]=m(Y[i],T[i],X[i,],b)
+    N[,i]=m2(Y[i],T[i],X[i,],b) 
+  }
+  
+  M_hat=rowMeans(M)
+  N_hat=rowMeans(N)
+  G_hat=t(B)%*%B/n.nl
+  
+  return(list(M_hat,N_hat,G_hat,B))
+}
+
+setwd("~/Downloads/rrr_401k_blackbox")
+```
+## Preparing Data
+
+The following "get_data" function will prepare the data for debiased machine learning. This code splits the data into three components:
+
+1) Y := vector of the outcome variable
+2) T := vector of the treatment variable
+3) X := matrix with confounding variables
+
+```{r}
+get_data<-function(df,spec,quintile){
+  ###  Inputs
+  ###  df: dataset that is being used. In this case a .dta but could be another format
+  ###  spec: value of 1,2,or 3.
+  ###  quintile: integer in [0,5]. 0 means all data, 1-5 indicates which quintile of income distribution to filter for
+  ###  Output
+  ###  List of (Y,D,X)
+  Y <- df[,"net_tfa"]
+  D <- df[,"e401"]
+  #  All three specifications incorporate the same variables, but differ in the number of higher order terms. X.L has no higher order terms. X.H has higher order terms up to the 8th degree for some variables. X.vH incorporates higher order and interaction terms.
+  ## low dim specification
+  X.L <- cbind(df[,"age"], df[,"inc"], df[,"educ"], df[,"fsize"], df[,"marr"], df[,"twoearn"], df[,"db"], df[,"pira"], df[,"hown"])
+
+  ## high dim specification.
+  X.H <- cbind(poly(df[,"age"], 6, raw=TRUE),
+               poly(df[,"inc"], 8, raw=TRUE),
+               poly(df[,"educ"], 4, raw=TRUE),
+               poly(df[,"fsize"], 2, raw=TRUE),
+               df[,"marr"], df[,"twoearn"], df[,"db"], df[,"pira"], df[,"hown"])
+
+  ## very high dim specification
+  X.vH=model.matrix(~(poly(df[,"age"], 6, raw=TRUE) +
+                        poly(df[,"inc"], 8, raw=TRUE) +
+                        poly(df[,"educ"], 4, raw=TRUE) +
+                        poly(df[,"fsize"], 2, raw=TRUE) +
+                        df[,"marr"] +
+                        df[,"twoearn"] +
+                        df[,"db"] +
+                        df[,"pira"] +
+                        df[,"hown"])^2)
+  X.vH=X.vH[,-1]
+  
+  #Selects for desires specification
+  if (spec==1){
+    X=X.L
+  } else if (spec==2) {
+    X=X.H
+  } else {
+    X=X.vH
+  }
+  
+  X <- scale(X,center=TRUE,scale=TRUE) #Centers and scales X
+  n=nrow(X)
+  #Impose common support. More discussion in Appendix B.
+  p.1 <- multinom(D~X-1, trace=FALSE)$fitted.values
+  indexes.to.drop <- which(p.1 < min(p.1[D==1]) | max(p.1[D==1]) < p.1)
+  if (length(indexes.to.drop)==0) {indexes.to.drop <- n+1}	#R throws a wobbly if [-indexes.to.drop] is negating an empty set. 
+  n.per.treatment <- as.vector(table(D[-indexes.to.drop]))
+  n.trim <- n.per.treatment[1]+n.per.treatment[2]
+  
+  Y.trimmed=Y[-indexes.to.drop]
+  D.trimmed=D[-indexes.to.drop]
+  X.trimmed=X[-indexes.to.drop,]
+  
+  if (spec==1){
+    inc=X.trimmed[,2]
+  } else if (spec==2) {
+    inc=X.trimmed[,7]
+  } else {
+    inc=X.trimmed[,7]
+  }
+  #Filters for desired quintile
+  if (quintile>0){
+    q <- ntile(inc, 5)
+    Y.q=Y.trimmed[q==quintile]
+    D.q=D.trimmed[q==quintile]
+    X.q=X.trimmed[q==quintile,]
+  } else {
+    Y.q=Y.trimmed
+    D.q=D.trimmed
+    X.q=X.trimmed
+  }
+  
+  return(list(Y.q,D.q,X.q))
+  
+}
+```
+## Learning Alpha and Gamma
+
+Once the data is in the correct form, we can begin stage one of this algorithm. This involves estimating $\alpha$ and $\gamma$ using machine learning. This code sets up various machine learning models that can be applied here. In the following code, "RMD_dantzig" and "RMD_lasso" implement dantzig and lasso learning models respectively. Then, "RMD_stable" implements the algorithm to find $\hat{\rho}$, the coefficient of $\hat{\alpha}$, and $\hat{\beta}$, the coeffecient of $\hat{\gamma}$. Understanding "RMD_dantzig", "RMD_lasso", and "get_D" in depth is not essential to understanding this code. These are essentially helper functions that assist in tuning parameters in our learned models.
+
+```{r}
+l=0.1
+
+#Dantzig learning algorithm to tune regularization parameter
+RMD_dantzig <- function(M, G, D, lambda=0, sparse = TRUE) {
+  
+  p <- ncol(G)
+  zp <- rep(0, p)
+  L <-c(l,rep(1,p-1)) #dictionary is ordered (constant,T,X,TX)
+  
+  A <- solve(diag(D),G)
+  R <- rbind(A, -A)
+  
+  a <- solve(diag(D),M)
+  r <- c(a - lambda*L, -a - lambda*L)
+  
+  if(sparse) {
+    Ip <- as(p, "matrix.diag.csr")
+    R <- as.matrix.csr(R)
+    f <- rq.fit.sfnc(Ip, zp, R = R, r = r)
+  } else {
+    Ip <- diag(p)
+    f <- rq.fit.fnc(Ip, zp, R = R, r = r)
+  }
+  
+  return(f)
+}
+#Lasso learning algorithm to tune the regularization paremeter of our model
+RMD_lasso <- function(M, G, D, lambda=0, control = list(maxIter = 1000, optTol = 10^(-5), 
+                                                        zeroThreshold = 10^(-6)), beta.start = NULL) {
+  
+  p <- ncol(G)
+  
+  Gt<-G
+  Mt<-M
+  
+  L <-c(l,rep(1,p-1)) #dictionary is ordered (constant,...)
+  lambda_vec=lambda*L*D #v3: insert D here
+  
+  if (is.null(beta.start)) {
+    beta <- rep(0,p) #vs low-dimensional initialization
+  }
+  else {
+    beta <- beta.start
+  }
+  wp <- beta
+  mm <- 1
+  while (mm < control$maxIter) {
+    beta_old <- beta
+    for (j in 1:p) {
+      rho=Mt[j]-Gt[j,]%*%beta+Gt[j,j]*beta[j]
+      z=Gt[j,j]
+      
+      if (sum(is.na(rho)) >= 1) {
+        beta[j] <- 0
+        next
+      }
+      if (rho < -1 * lambda_vec[j]) 
+        beta[j] <- (rho+lambda_vec[j])/z
+      if (abs(rho) <= lambda_vec[j]) 
+        beta[j] <- 0
+      if (rho > lambda_vec[j]) 
+        beta[j] <- (rho-lambda_vec[j])/z
+    }
+    wp <- cbind(wp, beta)
+    if (sum(abs(beta - beta_old), na.rm = TRUE) < control$optTol) {
+      break
+    }
+    mm <- mm + 1
+  }
+  w <- beta
+  w[abs(w) < control$zeroThreshold] <- 0
+  return(list(coefficients = w, coef.list = wp, num.it = mm))
+}
+
+#Performs theoretical iteration to help tune our regularization parameter
+get_D <- function(Y,T,X,m,rho_hat,b){
+  n=nrow(X)
+  p=length(b(T[1],X[1,]))
+  
+  df=matrix(0,p,n)
+  for (i in 1:n){
+    df[,i]=b(T[i],X[i,])*as.vector(rho_hat %*% b(T[i],X[i,]))-m(Y[i],T[i],X[i,],b)
+  }
+  df=df^2
+  D2=rowMeans(df)
+  
+  D=sqrt(D2)
+  return(D) #pass around D as vector
+}
+
+c=0.5
+alpha=0.1
+tol=1e-6
+#Calculates ML function for alpha and gamma
+RMD_stable<-function(Y,T,X,p0,D_LB,D_add,max_iter,b,is_alpha = TRUE,is_lasso = TRUE){
+  ###Inputs
+  ###Y,T,X: data
+  ###p0: initial parameter for p
+  ###D_LB: Lower bound on D
+  ###D_add: value added to D
+  ###max_iter: maximum iterations of chosen ML algorithm
+  ###b: dictionary 
+  ###is_alpha: True = return alpha, False = return gamma
+  ###is_lasso: True = use lasso, False = use dantzig
+  ###Output
+  ###rho_hat or beta_hat, a vector to estimate alpha or gamma rescpectively by taking the dot product with b
+  k=1
+  
+  p=length(b(T[1],X[1,]))
+  n=length(T)
+  
+  # low-dimensional moments
+  X0=X[,1:p0]
+  MNG0<-get_MNG(Y,T,X0,b)
+  M_hat0=MNG0[[1]]
+  N_hat0=MNG0[[2]]
+  G_hat0=MNG0[[3]]
+  
+  # initial estimate
+  rho_hat0=solve(G_hat0,M_hat0)
+  rho_hat=c(rho_hat0,rep(0,p-ncol(G_hat0)))
+  beta_hat0=solve(G_hat0,N_hat0)
+  beta_hat=c(beta_hat0,rep(0,p-ncol(G_hat0)))
+  
+  # moments
+  MNG<-get_MNG(Y,T,X,b)
+  M_hat=MNG[[1]]
+  N_hat=MNG[[2]]
+  G_hat=MNG[[3]]
+  
+  # penalty
+  lambda=c*qnorm(1-alpha/(2*p))/sqrt(n) # snippet
+  
+  if(is_alpha){ 
+    ###########
+    # alpha_hat
+    ###########
+    diff_rho=1
+    #Loop through max_iter times or until the change in rho between iterations is less than tol
+    while(diff_rho>tol & k<=max_iter){
+      
+      # previous values
+      rho_hat_old=rho_hat+0
+      
+      # normalization
+      D_hat_rho=get_D(Y,T,X,m,rho_hat_old,b)
+      D_hat_rho=pmax(D_LB,D_hat_rho)
+      D_hat_rho=D_hat_rho+D_add
+      
+      # RMD estimate
+      if(is_lasso){
+        rho_hat=RMD_lasso(M_hat, G_hat, D_hat_rho, lambda)$coefficients
+      }else{
+        rho_hat=RMD_dantzig(M_hat, G_hat, D_hat_rho, lambda)$coefficients
+      }
+      
+      # difference
+      diff_rho=two.norm(rho_hat-rho_hat_old)
+      k=k+1
+      
+      
+    }
+    
+    print(paste0('k: '))
+    print(paste0(k))
+    return(rho_hat)
+    
+  } else { 
+    ###########
+    # gamma_hat
+    ###########
+    diff_beta=1
+     #Loop through max_iter times or until the change in rho between iterations is less than tol
+    while(diff_beta>tol & k<=max_iter){
+      
+      # previous values
+      beta_hat_old=beta_hat+0
+      
+      # normalization
+      D_hat_beta=get_D(Y,T,X,m2,beta_hat_old,b)
+      D_hat_beta=pmax(D_LB,D_hat_beta)
+      D_hat_beta=D_hat_beta+D_add
+      
+      # RMD estimate
+      if(is_lasso){
+        beta_hat=RMD_lasso(N_hat, G_hat, D_hat_beta, lambda)$coefficients
+      }else{
+        beta_hat=RMD_dantzig(N_hat, G_hat, D_hat_beta, lambda)$coefficients
+      }
+      
+      # difference
+      diff_beta=two.norm(beta_hat-beta_hat_old)
+      k=k+1
+      
+    }
+    
+    print(paste0('k: '))
+    print(paste0(k))
+    return(beta_hat)
+    
+  }
+}
+
+arg_Forest<- list(clas_nodesize=1, reg_nodesize=5, ntree=1000, na.action=na.omit, replace=TRUE)
+arg_Nnet<- list(size=8,  maxit=1000, decay=0.01, MaxNWts=10000,  trace=FALSE)
+```
+Using the above functions, "get_stage1" returns $\alpha$ and $\gamma$ estimators for an outcome variable (Y), treatment variable (T) and confounding variables (X). The basic process for finding either $\alpha$ or $\gamma$ is to calculate the vector $\hat{\rho}$ or $\hat{\beta}$ respectively and then return a function that is the dot product of this vector with the chosen dictionary b that maps W in some way.
+
+```{r}
+get_stage1<-function(Y,T,X,p0,D_LB,D_add,max_iter,b,alpha_estimator = 1,gamma_estimator = 1){
+  ###Inputs
+  ###Y,T,X: data
+  ###p0: initial parameter for p
+  ###D_LB: Lower bound on D
+  ###D_add: value added to D
+  ###max_iter: maximum iterations of chosen ML algorithm
+  ###b: dictionary 
+  ###alpha_estimator: numerical value indicating which model to use for the alpha estimator
+  ###0 dantzig, 1 lasso
+  ###gamma_estimator: numerical value indicating which model to use for the gamma estimator
+  ###0 dantzig, 1 lasso, 2 rf, 3 nn
+  ###Output
+  ###alpha_hat and gamma_hat estimators
+  
+  p=length(b(T[1],X[1,]))
+  n=length(T)
+  MNG<-get_MNG(Y,T,X,b)
+  B=MNG[[4]]
+  
+  ###########
+  # alpha hat
+  ###########
+  if(alpha_estimator==0){ # dantzig
+    
+    rho_hat=RMD_stable(Y,T,X,p0,D_LB,D_add,max_iter,b,1,0)
+    alpha_hat<-function(d,z){
+      return(b(d,z)%*%rho_hat)
+    }
+    
+  } else if(alpha_estimator==1){ # lasso
+    
+    rho_hat=RMD_stable(Y,T,X,p0,D_LB,D_add,max_iter,b,1,1)
+    alpha_hat<-function(d,z){
+      return(b(d,z)%*%rho_hat)
+    }
+    
+  }
+  
+  ###########
+  # gamma hat
+  ###########
+  if(gamma_estimator==0){ # dantzig
+    
+    beta_hat=RMD_stable(Y,T,X,p0,D_LB,D_add,max_iter,b,0,0)
+    gamma_hat<-function(d,z){
+      return(b(d,z)%*%beta_hat)
+    }
+    
+  } else if(gamma_estimator==1){ # lasso
+    
+    beta_hat=RMD_stable(Y,T,X,p0,D_LB,D_add,max_iter,b,0,1)
+    gamma_hat<-function(d,z){ 
+      return(b(d,z)%*%beta_hat)
+    }
+    
+  } else if(gamma_estimator==2){ # random forest
+    
+    forest<- do.call(randomForest, append(list(x=B,y=Y), arg_Forest))
+    gamma_hat<-function(d,z){
+      return(predict(forest,newdata=b(d,z), type="response"))
+    }
+    
+  } else if(gamma_estimator==3){ # neural net
+    
+    # scale down, de-mean, run NN, scale up, remean so that NN works well
+    maxs_B <- apply(B, 2, max)
+    mins_B <- apply(B, 2, min)
+    
+    maxs_Y<-max(Y)
+    mins_Y<-min(Y)
+    
+    # hack to ensure that constant covariates do not become NA in the scaling
+    const=maxs_B==mins_B
+    keep=(1-const)*1:length(const)
+    
+    NN_B<-B
+    NN_B[,keep]<-scale(NN_B[,keep], center = mins_B[keep], scale = maxs_B[keep] - mins_B[keep])
+    
+    NN_Y<-scale(Y, center = mins_Y, scale = maxs_Y - mins_Y)
+    
+    nn<- do.call(nnet, append(list(x=NN_B,y=NN_Y), arg_Nnet))
+    gamma_hat<-function(d,z){
+      
+      test<-t(as.vector(b2(d,z)))
+      NN_b<-test
+      NN_b[,keep]<-scale(t(NN_b[,keep]), 
+                         center = mins_B[keep], 
+                         scale = maxs_B[keep] - mins_B[keep])
+      
+      NN_Y_hat<-predict(nn,newdata=NN_b)
+      Y_hat=NN_Y_hat*(maxs_Y-mins_Y)+mins_Y
+      
+      return(Y_hat)
+    }
+    
+  }
+  
+  return(list(alpha_hat,gamma_hat))
+  
+}
+```
+## Running DML
+
+The final step of this algorithm is to use the learned alpha and gamma estimators to estimate the parameter of interest. At this point we have functions set up that are able to learn the $\alpha$ and $\gamma$ functions. The "rrr" function starts by splitting up our data into subsets so that we can learn $\alpha$ and $\gamma$. It then learns $\alpha_i$ and $\gamma_i$ for all i and finds $\hat{\theta}$ and the standard error of $\hat{\theta}$.
+
+```{r}
+L=5 #parameter for number of subsets to split data into
+
+rrr<-function(Y,T,X,p0,D_LB,D_add,max_iter,dict,alpha_estimator,gamma_estimator,bias){
+  
+  n=nrow(X)
+  #Split up into I_1,...I_n
+  folds <- split(sample(n, n,replace=FALSE), as.factor(1:L))
+  
+  Psi_tilde=numeric(0) #Initialize Psi_tilde as 0. This will become a running list of
+  #Iterating through I_1,,,,I_n
+  for (l in 1:L){
+    #Breaks into two sets. variables with .l are not in X_i used for training. variables with .nl are used for calculating theta
+    Y.l=Y[folds[[l]]]
+    Y.nl=Y[-folds[[l]]]
+    
+    T.l=T[folds[[l]]]
+    T.nl=T[-folds[[l]]]
+    
+    X.l=X[folds[[l]],]
+    X.nl=X[-folds[[l]],]
+    
+    n.l=length(T.l)
+    n.nl=length(T.nl)
+    
+    # get stage 1 (on nl)
+    stage1_estimators<-get_stage1(Y.nl,T.nl,X.nl,p0,D_LB,D_add,max_iter,dict,alpha_estimator,gamma_estimator)
+    alpha_hat=stage1_estimators[[1]]
+    gamma_hat=stage1_estimators[[2]]
+    
+    print(paste0('fold: ',l))
+    
+    #get stage 2 (on l)
+    #psi_star
+    Psi_tilde.l=rep(0,n.l)
+    for (i in 1:n.l){
+      if(bias){ #plug-in
+        Psi_tilde.l[i]=psi_tilde_bias(Y.l[i],T.l[i],X.l[i,],m,alpha_hat,gamma_hat) # without subtracting theta_hat
+      }else{ #DML
+        Psi_tilde.l[i]=psi_tilde(Y.l[i],T.l[i],X.l[i,],m,alpha_hat,gamma_hat) # without subtracting theta_hat
+      }
+    }
+    
+    Psi_tilde=c(Psi_tilde,Psi_tilde.l)
+    
+    
+  }
+  
+  #point estimation
+  ate=mean(Psi_tilde)
+  
+  #influences
+  Psi=Psi_tilde-ate
+  
+  var=mean(Psi^2)
+  se=sqrt(var/n)
+  #Returns ATE and SE
+  out<-c(table(T)[[2]],table(T)[[1]],ate,se)
+  
+  return(out)
+}
+#Prints out the results of rrr in a way that is easy to read
+printer<-function(spec1){
+  print(paste(" treated: ",spec1[1], " untreated: ", spec1[2], "   ATE:    ",round(spec1[3],2), "   SE:   ", round(spec1[4],2), sep=""))
+}
+#Prints results of rrr in format suitable for LaTex
+for_tex<-function(spec1){
+  print(paste(" & ",spec1[1], " & ", spec1[2], "   &    ",round(spec1[3],2), "   &   ", round(spec1[4],2), sep=""))
+}
+```
+Now that all of the necessary parts are in place, the following code puts everything together and actually runs the debiased machine learning algorithm. It combines the first section of this guide that prepares the data, then runs "rrr" to actually estimate $\hat{\theta}$. Finally, it prints out the results. This code is capable of iterating through income quintiles if you're interested in $\hat{\theta}$ in different income groups. To implement this functionality comment out the indicated line. As a note on run times, the neural nets take quite a bit longer to run than lasso and dantzig. 
+```{r}
+for (quintile in 0:0){ #change "0:5" to "0:0" if you just want to run once on whole data set
+
+quintile=0 #comment out this line to iterate through quintiles
+
+  print(paste0('quintile: '))
+  print(paste0(quintile))
+  
+df  <- read.dta("sipp1991.dta")
+#df = read.csv("Voting.csv")
+
+spec=1 #spec in (1-3)
+#quintile=0 #quintile in (1-5). 0 means all quintiles
+data<-get_data(df,spec,quintile) #trimming like Farrell; different than Chernozhukov et al. 
+
+Y=data[[1]]
+T=data[[2]]
+X=data[[3]] #no intercept
+
+##################
+# helper functions
+##################
+
+
+# dictionary for calculating alpha (discussion in appendix C)
+dict=b # b for partially linear model, b2 for interacted model. note that b2 appears in stage1.R for NN
+p=length(b(T[1],X[1,]))
+
+
+#p0=dim(X0) used in low-dim dictionary in the stage 1 tuning procedure
+p0=ceiling(p/4) 
+if (p>60){
+  p0=ceiling(p/40)
+  
+}
+
+
+D_LB=0 #each diagonal entry of \hat{D} lower bounded by D_LB
+D_add=.2 #each diagonal entry of \hat{D} increased by D_add. 0.1 for 0, 0,.2 otw
+max_iter=10 #max number iterations in Dantzig selector iteration over estimation and weights
+
+###########
+# algorithm
+###########
+
+set.seed(1) # for sample splitting
+
+alpha_estimator=1
+gamma_estimator=1
+bias=0
+#alpha_estimator: 0 dantzig, 1 lasso
+#gamma_estimator: 0 dantzig, 1 lasso, 2 rf, 3 nn
+
+results<-rrr(Y,T,X,p0,D_LB,D_add,max_iter,dict,alpha_estimator,gamma_estimator,bias)
+printer(results)
+for_tex(results)
+
+}
+```
+
+## Appendix A: Using Other Data
+The above framework is very flexible and can be easily adapted to fit other data sets. To do so, it requires adjusting "get_data" to return Y,T, and X as a list, where Y and T are vectors and X is a matrix (It is important to note that you can't have any NA values in X,Y or T). The following steps outline this process:
+
+1. Change the input to "df  <- read.dta("sipp1991.dta")" in the final codeblock to the name of your dataset. If your data is in a .csv and not a .dta, then change "read.dta" to "read.csv"
+2. In the "get_data" function, change "net_tfa" in "Y <- df[,"net_tfa"]" to the name of your outcome variable.
+3. In the "get_data" function, change "e401" in "T <- df[,"e401"]"  to the name of your treatment variable. Make sure this is a binary variable. The following code can convert to a binary column
+```{r}
+#df = df%>%
+#  mutate(T = ifelse(column %in% c("list of values for treatment"),0,1))
+```
+4. In the "get_data" function, replace in "X.L <- cbind(df[,"age"], df[,"inc"], df[,"educ"], df[,"fsize"], df[,"marr"], df[,"twoearn"], df[,"db"], df[,"pira"], df[,"hown"])" all of the column names (qouted words within df[,]) with the columns of your X variables. Set spec=1, and comment out the lines for X.H and X.vH. You can also add higher order terms to X by using terms of the form "poly(df[,column],n,raw=TRUE)" to create matrices from column with polynomial terms up to n and combine using "cbind".
+
+
+## Appendix B: Common Support
+Common Support ensures that for all X, $P(X) = Pr(D=1|X)$ is between zero and one. This is a necessary condition for causal inference to work. To do this, $P(X_i) = Pr(D_i=1|X_i)$ is learned using some learning algorithm. Then, all $X_i$ values where $P(X_i)$ is too close to zero or one are thrown out. But what is too close? 
+
+The way we determine which values to throw out is by looking at $X_i$ in the treatment group (where $D_i = 1$) and see what range of values we get for $P(X_i)$. We then set the upper and lower limits of this range as the maximum and minimum allowable values that we'll include of $P(X_i)$. Thus, some values of $W_i$ 
+exist where $D_i = 0$ and $P(X_i)$ is outside the given range, and these $W_i$ are dropped. The code below creates a histogram with the dotted lines showing the limits of the common support interval. The second histogram is zoomed in to show more clearly what values fall outside the range. As can be seen in the graph, the vast majority of values fall between the dotted lines, which is a good sign.
+```{r}
+
+df  <- read.dta("sipp1991.dta")
+Y <- df[,"net_tfa"]
+D <- df[,"e401"]
+X.L <- cbind(df[,"age"], df[,"inc"], df[,"educ"], df[,"fsize"], df[,"marr"], df[,"twoearn"], df[,"db"], df[,"pira"], df[,"hown"])
+
+X <- scale(X.L,center=TRUE,scale=TRUE) #Centers and scales X
+  #Impose common support. More discussion in Appendix B.
+  p.1 <- multinom(D~X-1, trace=FALSE)$fitted.values
+  indexes.to.drop <- which(p.1 < min(p.1[D==1]) | max(p.1[D==1]) < p.1)
+
+probs = data.frame("treatment" = append(rep("Treated",length(p.1[D==1])),rep("Untreated",length(p.1[D==0]))),"value" = append(p.1[D==1],p.1[D==0]))  
+
+ggplot(probs,aes(x = value, fill = treatment))+
+  geom_histogram(alpha = 0.2, col = "black")+
+  geom_vline(xintercept = min(p.1[D==1]),linetype = "dotted")+
+  geom_vline(xintercept = max(p.1[D==1]),linetype = "dotted")
+
+probs %>%
+  filter(value<=0.25)%>%
+  ggplot(aes(x = value, fill = treatment))+
+  geom_histogram(alpha = 0.2, col = "black")+
+  geom_vline(xintercept = min(p.1[D==1]))
+
+
+
+```
+
+
+## Appendix C: Calculating Alpha
+Alpha--known as the Riesz representer--can be calculated in two different ways. The first way is using propensity scores as follows:
+
+1) Learn $$\pi(X) = P(D=1|X)$$. This is typically done by fitting a logistic curve to your data
+2) Calculate the Riesz representer from $\pi$ as $$\alpha_0(D,X) = \frac{D}{\pi(X)}+\frac{1-D}{1-\pi(X)}$$
+
+However, this suffers from several practical issues. For instance, since the propensity scores are learned on a logistic curve, there are often values very close to 0 or very close to 1. These values then result in large values in the denominator of alpha, making this calculation unstable. Fortunately, there is a more direct way to calculate the Riesz representer that is used in this guide. This approach leverages a powerful mathematical fact about the Riesz representer: $\mathbb{E}[m(W,\gamma)] = \mathbb{E}[\alpha_0(W)\gamma(W)]$. We can then try to find an $\alpha$ that minimizes the loss function $$L = \mathbb{E}[\alpha_0(W)-\alpha(W)]^2$$. 
+
+We can then use the above fact to derive the following: $$L(\alpha) = C-2\mathbb{E}[m(W,\alpha)]+\mathbb{E}[\alpha(W)]^2$$.
+
+We then assume the functional form of the Riesz representer as $$\alpha(W) = \rho^{'} b(W)$$ where $\rho^{'}$ is a vector and $b(W)$ maps W to some other vector. Since b is an arbitrary dictionary, it can include functional forms of W and interaction terms in W. This makes our chosen class for the functional form of the Riesz representer capable of representing a wide selection of functions. To find $\alpha$, we now need to find $\rho$.
+From here we can expand our loss function to $$L(\rho) = C-2\rho^{'}\hat{M}+\rho^{'}\hat{G}\rho$$ where $\hat{M} = 1/n \sum_{i=1}^{n}m(W_i,b)$ and $\hat{G} =1/n \sum_{i=1}^{n}b(W_i)b(W_i)^{'}$. Maximizing $L$ gives $\hat{\rho} = \hat{G}^{-1}\hat{M}$. Thus, starting from a simple fact about the Riesz representer and adopting a functional form for $\alpha$, we are able to estimate through a simple matrix multiplication using two matrices that can be easily computed from our chosen function for b and our learned function m.
+
+Now that we've solved the problem of estimating $\alpha$, we can expand on our work by using differnt loss functions. In the above example, we used a squared loss. However, we might want to add a regulization term, and have a loss function like $$L(\rho) = C-2\rho^{'}\hat{M}+\rho^{'}\hat{G}\rho+2\lambda||\rho||_1$$, which we could then optimize. Thus, using this approach we have a lot of options for how we want to measure $\alpha$ that rely on optimizing relatively simple loss functions
