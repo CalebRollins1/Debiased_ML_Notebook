@@ -17,6 +17,10 @@ final_exp100: Simulation with 500 iterations where X is 100 x 100 using measurem
 
 final_exp500: Simulation with 500 iterations where X is 500 x 500 using measurement error
 
+noise_401k: 401k with measurement error
+
+dropout_401k: 401k with missingness
+
 PCR_results: Results running PCR on simulated data with different number of principal components kept
 
 
