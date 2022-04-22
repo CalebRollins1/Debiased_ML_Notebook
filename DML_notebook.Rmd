@@ -48,6 +48,7 @@ library("ggplot2")
 library("quantreg") #used for rq.fit.sfn
 library("nnet")	#used for mulitnom
 library("randomForest")
+library("keras")
 
 #################
 #Basic Functions#
@@ -507,7 +508,60 @@ get_stage1<-function(Y,T,X,p0,D_LB,D_add,max_iter,b,alpha_estimator = 1,gamma_es
       return(Y_hat)
     }
     
+  } else if(gamma_estimator==4){ # 2 layer NN (keras)
+    
+    
+    # scale down, de-mean, run NN, scale up, remean so that NN works well
+    # hack to ensure that constant covariates do not become NA in the scaling
+    maxs_B <- apply(B, 2, max)
+    mins_B <- apply(B, 2, min)
+    maxs_Y<-max(Y)
+    mins_Y<-min(Y)
+    const=maxs_B==mins_B
+    keep=(1-const)*1:length(const)
+    NN_B<-B
+    NN_B[,keep]<-scale(NN_B[,keep], center = mins_B[keep], scale = maxs_B[keep] - mins_B[keep])
+    NN_Y<-scale(Y, center = mins_Y, scale = maxs_Y - mins_Y)
+      
+    # choose architecture
+    build_model <- function() {
+      model <- keras_model_sequential() %>% 
+        layer_dense(units = 8, activation = "relu", 
+                    input_shape = dim(NN_B)[[2]]) %>% 
+        layer_dense(units = 8, activation = "relu") %>% 
+        layer_dense(units = 1) 
+      
+      model %>% compile(
+        optimizer = "rmsprop", 
+        loss = "mse", 
+        metrics = c("mae")
+      )
+    }
+    
+    # use package
+    model <- build_model()
+    num_epochs <- 100
+    model %>% fit(NN_B, NN_Y,
+                  epochs = num_epochs, batch_size = 1, verbose = 0)
+    
+    gamma_hat<-function(d,z){
+      
+      NN_b<-t(as.vector(b(d,z))) # test point
+      NN_b[,keep]<-scale(t(NN_b[,keep]), 
+                         center = mins_B[keep], 
+                         scale = maxs_B[keep] - mins_B[keep])
+      
+      # 2 layer NN (keras)
+      NN_Y_hat<-model %>% predict(NN_b, verbose = 0)
+      
+      Y_hat=NN_Y_hat*(maxs_Y-mins_Y)+mins_Y
+      
+      return(Y_hat)
+    }
+    
   }
+  
+  
   
   return(list(alpha_hat,gamma_hat))
   
@@ -518,7 +572,7 @@ get_stage1<-function(Y,T,X,p0,D_LB,D_add,max_iter,b,alpha_estimator = 1,gamma_es
 The final step of this algorithm is to use the learned alpha and gamma estimators to estimate the parameter of interest. At this point we have functions set up that are able to learn the $\alpha$ and $\gamma$ functions. The "rrr" function starts by splitting up our data into subsets so that we can learn $\alpha$ and $\gamma$. It then learns $\alpha_i$ and $\gamma_i$ for all i and finds $\hat{\theta}$ and the standard error of $\hat{\theta}$.
 
 ```{r}
-L=5 #parameter for number of subsets to split data into
+L=2 #parameter for number of subsets to split data into
 
 rrr<-function(Y,T,X,p0,D_LB,D_add,max_iter,dict,alpha_estimator,gamma_estimator,bias){
   
@@ -636,10 +690,10 @@ max_iter=10 #max number iterations in Dantzig selector iteration over estimation
 set.seed(1) # for sample splitting
 
 alpha_estimator=1
-gamma_estimator=1
+gamma_estimator=2
 bias=0
 #alpha_estimator: 0 dantzig, 1 lasso
-#gamma_estimator: 0 dantzig, 1 lasso, 2 rf, 3 nn
+#gamma_estimator: 0 dantzig, 1 lasso, 2 rf, 3 nn, 4 2-layer nn
 
 results<-rrr(Y,T,X,p0,D_LB,D_add,max_iter,dict,alpha_estimator,gamma_estimator,bias)
 printer(results)
